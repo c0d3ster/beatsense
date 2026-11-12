@@ -1,0 +1,122 @@
+import { describe, expect, it } from 'vitest'
+import { RollReader, rollLevel, type RollLevel } from '../../src/drums/roll-rate'
+
+const PERIOD = 500 // 120 BPM
+
+// Snare hits `gapMs` apart ending at `endMs`, as drum-hits.ts lists them: the snare's, then the clap's (none).
+const hitsEvery = (gapMs: number, count: number, endMs: number): number[][] => [
+  Array.from({ length: count }, (_, i) => endMs - (count - 1 - i) * gapMs),
+  [],
+]
+
+describe('rollLevel', () => {
+  it('reads quarters, eighths and sixteenths from the gap against the beat', () => {
+    expect(rollLevel(hitsEvery(500, 4, 5000), PERIOD, 5000)).toBe(4)
+    expect(rollLevel(hitsEvery(250, 6, 5000), PERIOD, 5000)).toBe(8)
+    expect(rollLevel(hitsEvery(125, 10, 5000), PERIOD, 5000)).toBe(16)
+  })
+
+  it('needs a tempo to measure against', () => {
+    expect(rollLevel(hitsEvery(250, 6, 5000), null, 5000)).toBeNull()
+  })
+
+  it('is null with fewer than three hits', () => {
+    expect(rollLevel(hitsEvery(1000, 2, 5000), PERIOD, 5000)).toBeNull()
+    expect(rollLevel(hitsEvery(500, 2, 5000), PERIOD, 5000)).toBeNull()
+  })
+
+  it('is null for a backbeat, and for a backbeat with one fill hit in it', () => {
+    expect(rollLevel(hitsEvery(1000, 6, 5000), PERIOD, 5000)).toBeNull()
+    expect(rollLevel([[3500, 4000, 5000], []], PERIOD, 5000)).toBeNull()
+  })
+
+  it('keeps reading quarters all the way to the next hit', () => {
+    const quarters = [[3000, 3500, 4000, 4500, 5000], []]
+    ;[5000, 5250, 5490].forEach((now) => expect(rollLevel(quarters, PERIOD, now)).toBe(4))
+  })
+
+  it('is null once the roll has stopped for a beat', () => {
+    expect(rollLevel(hitsEvery(250, 6, 5000), PERIOD, 5400)).toBe(8)
+    expect(rollLevel(hitsEvery(250, 6, 5000), PERIOD, 5600)).toBeNull()
+  })
+
+  it('follows a roll that doubles its speed once two of the newest gaps are at the new speed', () => {
+    const quartersThenEighths = [[3000, 3500, 4000, 4500, 4750, 5000], []]
+    // Newest gaps: 500, 250, 250 -> the middle one (250) is eighths.
+    expect(rollLevel(quartersThenEighths, PERIOD, 5000)).toBe(8)
+    // One gap into it, quarters still: 500, 500, 250.
+    expect(rollLevel([[3000, 3500, 4000, 4500, 4750], []], PERIOD, 4750)).toBe(4)
+  })
+
+  it('counts a snare and a clap layered on the same step once', () => {
+    const layered = [[4000, 4500, 5000], [4010, 4510, 5010]]
+    expect(rollLevel(layered, PERIOD, 5010)).toBe(4)
+  })
+
+  it('reads a clap roll as well as a snare roll, and the two together', () => {
+    expect(rollLevel([[], [4000, 4250, 4500, 4750, 5000]], PERIOD, 5000)).toBe(8)
+    expect(rollLevel([[4000, 4500, 5000], [4250, 4750]], PERIOD, 5000)).toBe(8)
+  })
+})
+
+
+describe('RollReader', () => {
+  // Reads every 20 ms from `from` to `to` over the same hits, returning what it showed at each read.
+  const readOver = (reader: RollReader, hits: number[][], from: number, to: number): Array<RollLevel | null> => {
+    const shown: Array<RollLevel | null> = []
+    for (let t = from; t <= to; t += 20) shown.push(reader.read(hits.map((band) => band.filter((time) => time <= t)), PERIOD, t))
+    return shown
+  }
+
+  it('shows a note value once it has been read for half a beat', () => {
+    const reader = new RollReader()
+    const hits = hitsEvery(250, 12, 5500)
+    // The raw reading starts at the third hit (3500); half a beat later it shows.
+    expect(reader.read(hits.map((band) => band.filter((time) => time <= 3500)), PERIOD, 3500)).toBeNull()
+    expect(readOver(reader, hits, 3520, 3800).at(-1)).toBe(8)
+  })
+
+  it('keeps showing through a dropped hit, and clears a beat after the roll stops', () => {
+    const reader = new RollReader()
+    // Eighths with one hit missing at 4500: the raw reading wobbles there.
+    const hits = [[3000, 3250, 3500, 3750, 4000, 4250, 4750, 5000], []]
+    const shown = readOver(reader, hits, 3500, 5400)
+    expect(shown.slice(shown.indexOf(8))).not.toContain(null)
+    expect(readOver(reader, hits, 5420, 6100).at(-1)).toBeNull()
+  })
+
+  it('keeps showing quarters through a missed hit', () => {
+    const reader = new RollReader()
+    const hits = [[2000, 2500, 3000, 3500, 4000, 5000, 5500, 6000], []]
+    const shown = readOver(reader, hits, 3000, 6000)
+    expect(shown.slice(shown.indexOf(4))).not.toContain(null)
+  })
+
+  it('does not swap for one odd gap', () => {
+    const reader = new RollReader()
+    const eighths = hitsEvery(250, 8, 4750)
+    readOver(reader, eighths, 3500, 4750)
+    // One late hit makes the newest gaps read as quarters for a moment, then eighths again.
+    const withLate = [[...(eighths[0] ?? []), 5150, 5400, 5650, 5900], []]
+    expect(readOver(reader, withLate, 4760, 5900)).not.toContain(4)
+  })
+
+  it('reads at most 20 times a second when ticked every frame, fetching the hits only then', () => {
+    const reader = new RollReader()
+    const hits = hitsEvery(250, 12, 5500)
+    let fetches = 0
+    const onsets = (): number[][] => {
+      fetches++
+      return hits
+    }
+    for (let t = 5000; t < 6000; t += 1000 / 240) reader.tick(onsets, PERIOD, t)
+    expect(fetches).toBe(20)
+  })
+
+  it('starts from nothing after a reset', () => {
+    const reader = new RollReader()
+    readOver(reader, hitsEvery(250, 8, 5000), 3500, 5000)
+    expect(reader.reset()).toBeNull()
+    expect(reader.read(hitsEvery(250, 8, 5000), PERIOD, 5000)).toBeNull()
+  })
+})
